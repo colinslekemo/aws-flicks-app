@@ -8,7 +8,7 @@ Parameters:
 
 Resources:
   # =========================================================================
-  # 1. COUCHE BASE DE DONNÉES ET STOCKAGE (S3 with Public & CORS Accès )
+  # 1. DATA BASE AND STORAGE LAYER (S3 with Public & CORS Accès )
   # =========================================================================
   FlicksDynamoDBTable:
     Type: 'AWS::DynamoDB::Table'
