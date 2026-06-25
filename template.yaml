@@ -1,0 +1,346 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Flicks Application - Infrastructure complete avec detection stricte du Content-Type S3'
+
+Parameters:
+  AmazonLinuxAMIID:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+Resources:
+  # =========================================================================
+  # 1. COUCHE BASE DE DONNÉES ET STOCKAGE (S3 with Public & CORS Accès )
+  # =========================================================================
+  FlicksDynamoDBTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: 'flicks-table'
+      AttributeDefinitions:
+        - AttributeName: 'EIB'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'EIB'
+          KeyType: 'HASH'
+      BillingMode: PAY_PER_REQUEST
+
+  FlicksS3Bucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub 'flicks-storage-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: ['GET', 'PUT', 'POST', 'DELETE', 'HEAD']
+            AllowedOrigins: ['*']
+
+  FlicksS3BucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref FlicksS3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub '${FlicksS3Bucket.Arn}/*'
+
+  # =========================================================================
+  # 2. Network Layer
+  # =========================================================================
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      EnableDnsHostnames: true
+      CidrBlock: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: Flicks VPC
+
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Flicks IGW
+
+  AttachGateway:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    DependsOn: AttachGateway
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select 
+        - '0'
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: Flicks Public Subnet 1
+
+  PublicRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Flicks Public Route Table
+
+  PublicRoute:
+    Type: 'AWS::EC2::Route'
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  # =========================================================================
+  # 3. Network Security (Ports HTTP 80 et Flask 5000)
+  # =========================================================================
+  WebSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable HTTP access on Port 80 and 5000
+      GroupName: Flicks Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: Flicks SG
+
+  # =========================================================================
+  # 4. EC2 server with Embaded code (AWS::CloudFormation::Init)
+  # =========================================================================
+  WebInstance:
+    Type: 'AWS::EC2::Instance'
+    DependsOn: PublicSubnet1RouteTableAssociation
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          directories:
+            /var/app:
+              mode: '0755'
+            /var/app/templates:
+              mode: '0755'
+          files:
+            /var/app/app.py:
+              content: !Sub |
+                import os, uuid, boto3
+                from flask import Flask, render_template, request, redirect, url_for
+                from PIL import Image
+                from werkzeug.utils import secure_filename
+
+                app = Flask(__name__)
+                BUCKET_NAME = "flicks-storage-${AWS::AccountId}"
+                TABLE_NAME = "flicks-table"
+                
+                s3_client = boto3.client('s3', region_name='${AWS::Region}')
+                dynamodb = boto3.resource('dynamodb', region_name='${AWS::Region}')
+                table = dynamodb.Table(TABLE_NAME)
+
+                UPLOAD_FOLDER = os.path.join('static', 'uploads')
+                app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+                @app.route('/')
+                def index():
+                    items = []
+                    try:
+                        response = table.scan()
+                        items = response.get('Items', [])
+                    except Exception as e:
+                        print(e)
+                    return render_template('index.html', items=items)
+
+                @app.route('/new', methods=['GET', 'POST'])
+                def new_flick():
+                    if request.method == 'POST':
+                        title = request.form.get('title')
+                        description = request.form.get('description')
+                        tags = request.form.get('tags')
+                        file = request.files.get('image')
+                        if file and file.filename != '':
+                            filename = secure_filename(file.filename)
+                            unique_id = str(uuid.uuid4())
+                            saved_img_name = f"{unique_id}_{filename}"
+                            saved_thumb_name = f"thumb_{unique_id}_{filename}"
+                            
+                            image_path = os.path.join(app.config['UPLOAD_FOLDER'], saved_img_name)
+                            thumbnail_path = os.path.join(app.config['UPLOAD_FOLDER'], saved_thumb_name)
+                            
+                            file.save(image_path)
+                            with Image.open(image_path) as img:
+                                img.thumbnail((120, 120))
+                                img.save(thumbnail_path)
+                            
+                            # Détection manuelle et stricte de l'extension pour forcer l'affichage dans le navigateur
+                            filename_lower = filename.lower()
+                            if filename_lower.endswith('.png'):
+                                content_type = 'image/png'
+                            elif filename_lower.endswith(('.jpg', '.jpeg')):
+                                content_type = 'image/jpeg'
+                            elif filename_lower.endswith('.gif'):
+                                content_type = 'image/gif'
+                            else:
+                                content_type = 'image/jpeg'
+                            
+                            try:
+                                s3_client.upload_file(image_path, BUCKET_NAME, saved_img_name, ExtraArgs={'ContentType': content_type})
+                                s3_client.upload_file(thumbnail_path, BUCKET_NAME, saved_thumb_name, ExtraArgs={'ContentType': content_type})
+                                
+                                image_url = f"https://{BUCKET_NAME}.s3.amazonaws.com/{saved_img_name}"
+                                thumbnail_url = f"https://{BUCKET_NAME}.s3.amazonaws.com/{saved_thumb_name}"
+                                
+                                table.put_item(Item={
+                                    'EIB': unique_id, 'Title': title, 'Description': description,
+                                    'Tags': tags, 'ImageURL': image_url, 'ThumbnailURL': thumbnail_url
+                                })
+                            except Exception as e:
+                                print(e)
+                            finally:
+                                if os.path.exists(image_path): os.remove(image_path)
+                                if os.path.exists(thumbnail_path): os.remove(thumbnail_path)
+                            return redirect(url_for('index'))
+                    return render_template('new.html')
+
+                if __name__ == '__main__':
+                    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+                    app.run(host='0.0.0.0', port=80)
+              mode: '0644'
+
+            /var/app/templates/index.html:
+              content: |
+                <!DOCTYPE html>
+                <html lang="en">
+                <head><title>Flicks</title><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css"></head>
+                <body class="container my-5">
+                    <h1 class="display-4 fw-bold mb-4">Flicks</h1>
+                    <a href="/new" class="btn btn-primary mb-4">New</a>
+                    <table class="table table-bordered table-striped align-middle">
+                        <thead class="table-light"><tr><th>EIB</th><th>Title</th><th>Description</th><th>Tags</th><th>Image Thumbnail</th></tr></thead>
+                        <tbody>
+                            {% if not items %}<tr><td colspan="5" class="text-center py-4 text-muted"><em>No flicks available. Click the "New" button above to upload your first photo!</em></td></tr>{% endif %}
+                            {% for item in items %}
+                            <tr>
+                                <td><code class="text-muted">{{ item.EIB }}</code></td>
+                                <td><strong>{{ item.Title }}</strong></td>
+                                <td>{{ item.Description }}</td>
+                                <td><span class="badge bg-secondary">{{ item.Tags }}</span></td>
+                                <td>
+                                    <a href="{{ item.ImageURL }}" target="_blank" title="Click to view full image">
+                                        <img src="{{ item.ThumbnailURL }}" alt="Thumbnail" style="max-height: 80px; border-radius: 4px; cursor: pointer; border: 1px solid #dee2e6;">
+                                    </a>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </body>
+                </html>
+              mode: '0644'
+
+            /var/app/templates/new.html:
+              content: |
+                <!DOCTYPE html>
+                <html lang="en">
+                <head><title>New Flick</title><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css"></head>
+                <body class="container my-5" style="max-width: 600px;">
+                    <h1 class="display-5 fw-bold mb-4">New Flick</h1>
+                    <form action="/new" method="POST" enctype="multipart/form-data">
+                        <div class="mb-3"><label class="form-label fw-bold">Title</label><input type="text" name="title" class="form-control" required></div>
+                        <div class="mb-3"><label class="form-label fw-bold">Description</label><textarea name="description" class="form-control" rows="3" required></textarea></div>
+                        <div class="mb-3"><label class="form-label fw-bold">Tags</label><input type="text" name="tags" class="form-control" placeholder="e.g. humber, lounge" required></div>
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">Image file</label>
+                            <div class="input-group">
+                                <label class="input-group-text" for="imageInput">Choose File</label>
+                                <input type="file" name="image" class="form-control" id="imageInput" accept="image/*" required style="display: none;">
+                                <span class="form-control text-muted" id="file-chosen">No file chosen</span>
+                            </div>
+                        </div>
+                        <button type="submit" class="btn btn-primary">Create Flick</button> <a href="/" class="btn btn-outline-secondary">Cancel</a>
+                    </form>
+                    <script>
+                        const imageInput = document.getElementById('imageInput'); const fileChosen = document.getElementById('file-chosen');
+                        imageInput.addEventListener('change', function() {
+                            if (this.files && this.files.length > 0) { fileChosen.textContent = this.files[0].name; fileChosen.classList.remove('text-muted'); }
+                            else { fileChosen.textContent = "No file chosen"; fileChosen.classList.add('text-muted'); }
+                        });
+                    </script>
+                </body>
+                </html>
+              mode: '0644'
+
+    Properties:
+      IamInstanceProfile: "LabInstanceProfile"
+      ImageId: !Ref AmazonLinuxAMIID
+      InstanceType: t3.micro
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref PublicSubnet1
+          GroupSet:
+            - !Ref WebSecurityGroup
+      SourceDestCheck: false
+      Tags:
+        - Key: Name
+          Value: Flicks Web Station
+      UserData: !Base64
+        Fn::Sub: |
+          #!/bin/bash -xe
+          exec > /var/log/user-data.log 2>&1
+          
+          yum -y update
+          yum install -y aws-cfn-bootstrap python3-pip
+          
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource WebInstance --region ${AWS::Region}
+          
+          pip3 install flask boto3 pillow werkzeug
+          
+          cat > /etc/systemd/system/flicks-app.service <<EOF
+          [Unit]
+          Description=Flicks Application Python Flask
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          Type=simple
+          WorkingDirectory=/var/app
+          ExecStart=/usr/bin/python3 /var/app/app.py
+          Restart=always
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          
+          systemctl daemon-reload
+          systemctl enable flicks-app
+          systemctl start flicks-app
+
+Outputs:
+  PublicWebApplicationURL:
+    Description: URL d acces en direct a ton application Flicks !
+    Value: !Sub 'http://${WebInstance.PublicDnsName}'
